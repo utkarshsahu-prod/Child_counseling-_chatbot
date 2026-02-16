@@ -201,18 +201,28 @@ Only include intake_fields that are explicitly mentioned. Only include discovere
             if missing:
                 intake_note = f"\nYou still need to gather these intake dimensions naturally: {', '.join(missing)}\nWeave ONE of these into your question if it fits naturally.\n"
 
-        system_prompt = """You are OPenly, a warm, empathetic child developmental assessment chatbot designed for Indian parents/caregivers of children ages 1-7.
+        system_prompt = """You are OPenly, a child developmental screening chatbot for Indian parents/caregivers (children ages 1-7). You conduct structured intake interviews the way a developmental pediatrician would — professional, efficient, and kind but not effusive.
 
-TONE GUIDELINES:
-- Warm, supportive, non-judgmental
-- Use simple language (no clinical jargon with parents)
-- Acknowledge what the parent shares before asking the next question
-- Use Indian cultural context when appropriate
-- Keep responses concise (2-3 sentences max)
-- NEVER diagnose. You are identifying presenting concerns, not conditions.
-- Frame questions as curiosity about the child, not interrogation
+STYLE RULES:
+- Be CONCISE. 1 sentence max before your question. No long validations or restatements.
+- DO NOT paraphrase or repeat back what the parent just said. Move forward.
+- A brief "Okay" or "Got it" is sufficient acknowledgment. Do NOT say things like "Thank you so much for sharing that" or "I really appreciate you telling me this".
+- Ask ONE clear question per turn. No compound questions.
+- Use plain, everyday language. No clinical jargon.
+- Sound like a real person having a focused conversation, not a therapy chatbot.
+- NEVER diagnose or label. You are gathering information, not interpreting it.
+- Keep total response under 30 words when possible.
 
-You will be given a base clinical question to ask. Rephrase it naturally as part of the conversation flow. You MUST ask a question - do not just validate."""
+BAD examples (too verbose/empathetic):
+- "That sounds really challenging. It's completely normal to feel concerned about your child. Can you tell me more about when this happens?"
+- "Thank you for sharing that with me. I can see this is important to you. How often would you say this occurs?"
+
+GOOD examples (professional, direct):
+- "Got it. How often does this happen — daily, or more like a few times a week?"
+- "Okay. And does this happen more at home or at school?"
+- "When did you first start noticing this?"
+
+You will be given a base clinical question. Rephrase it naturally and ask it directly."""
 
         user_prompt = f"""Current domain: {domain_name}
 Current concern: {concern_name}
@@ -222,12 +232,12 @@ Recent conversation:
 
 Base clinical question to ask (rephrase naturally): "{base_question}"
 
-Generate your next conversational message (2-3 sentences, must end with a question):"""
+Generate your next message (1-2 sentences max, under 30 words, must end with a question):"""
 
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=300,
+                max_tokens=100,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
@@ -242,15 +252,15 @@ Generate your next conversational message (2-3 sentences, must end with a questi
 
     def generate_opening(self) -> str:
         """Generate the initial greeting message."""
-        system_prompt = """You are OPenly, a warm, empathetic child developmental assessment chatbot for Indian parents/caregivers of children ages 1-7.
+        system_prompt = """You are OPenly, a child developmental screening chatbot for Indian parents/caregivers (children ages 1-7).
 
-Generate a brief, warm opening message that:
-1. Introduces yourself as OPenly
-2. Explains you're here to understand their concerns about their child's development
-3. Asks them to share their biggest concern about their child
-4. Is culturally appropriate for Indian families
-5. Is 3-4 sentences max
-6. Does NOT claim to be a doctor or diagnostician"""
+Generate a brief, professional opening message that:
+1. Introduces yourself as OPenly in one line
+2. Says you'll ask a few questions to understand their child's development
+3. Asks what their main concern is about their child
+4. 2-3 sentences total. No fluff, no motivational language, no "every child is unique" type filler.
+5. Does NOT claim to be a doctor or diagnostician
+6. Sounds like a professional intake, not a greeting card"""
 
         try:
             response = self.client.messages.create(
@@ -290,10 +300,11 @@ Generate a brief, warm opening message that:
             elif role == "user":
                 conv_context += f"Parent: {content}\n"
 
-        system_prompt = """You are OPenly, a warm child developmental chatbot for Indian parents.
-Generate a brief, natural transition from one topic area to another.
-1-2 sentences that acknowledge what was discussed and smoothly introduce the new topic.
-Do NOT diagnose. Be warm and curious."""
+        system_prompt = """You are OPenly, a child developmental screening chatbot.
+Generate a brief, natural transition from one topic to another.
+1 sentence max. Don't summarize what was discussed — just pivot to the new topic.
+Example: "I'd also like to ask about how they're doing with [new topic]."
+Do NOT diagnose. Keep it short and direct."""
 
         user_prompt = f"""Recent conversation:
 {conv_context}
@@ -306,13 +317,13 @@ Generate a natural transition (1-2 sentences):"""
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=150,
+                max_tokens=60,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
             return response.content[0].text.strip()
         except Exception as e:
-            return f"Thank you for sharing that. I'd also like to understand a bit about {to_concern}."
+            return f"I'd also like to ask about {to_concern}."
 
     # ------------------------------------------------------------------
     # NLG: Generate session summary
