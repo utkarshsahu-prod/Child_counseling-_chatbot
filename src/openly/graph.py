@@ -65,6 +65,9 @@ class GraphState:
     # Question cursor per domain-concern
     question_cursors: dict[str, int] = field(default_factory=dict)
 
+    # Concerns explicitly triggered by NLU discovery
+    triggered_concerns: set[str] = field(default_factory=set)
+
     # Output
     bot_message: str = ""
     should_end: bool = False
@@ -312,12 +315,35 @@ class OpenlyGraph:
                 "domain": domain_id,
                 "concern": concern.name,
             })
-            # Check if there are more concerns in this domain
+            # Check if discovered tags triggered another concern in this domain
             next_concern = self._find_next_concern(state, domain)
             if next_concern:
+                old_concern = concern.name
                 state["active_concern_name"] = next_concern.name
+                state["trace_log"].append({
+                    "event": "concern_transition",
+                    "domain": domain_id,
+                    "from_concern": old_concern,
+                    "to_concern": next_concern.name,
+                    "reason": "tag_driven_transition",
+                })
+                # Generate a transition message so the parent understands the shift
+                transition_msg = self.llm.generate_transition(
+                    from_domain=f"{domain.display_name} - {old_concern}",
+                    to_domain=f"{domain.display_name} - {next_concern.name}",
+                    to_concern=next_concern.name,
+                    conversation_history=state.get("conversation_history", []),
+                )
+                state["_pending_transition"] = transition_msg
                 return self._node_probe_domain(state)  # recurse with new concern
+
+            # No more tag-triggered concerns in this domain — move on
             state["should_end"] = True
+            state["trace_log"].append({
+                "event": "domain_probing_complete",
+                "domain": domain_id,
+                "reason": "no_more_tag_triggered_concerns",
+            })
             return state
 
         question_obj = concern.questions[cursor]
@@ -339,6 +365,11 @@ class OpenlyGraph:
             intake_status=intake_status,
         )
 
+        # Prepend transition message if switching concerns/domains
+        pending_transition = state.pop("_pending_transition", None)
+        if pending_transition:
+            natural_question = pending_transition + " " + natural_question
+
         state["bot_message"] = natural_question
         state["conversation_history"].append({"role": "assistant", "content": natural_question})
         state["phase"] = "probing"
@@ -354,11 +385,51 @@ class OpenlyGraph:
         return state
 
     def _find_next_concern(self, state: dict, domain: ClinicalDomain) -> PresentingConcern | None:
+        """Find the next concern to probe — TAG-DRIVEN, not sequential.
+
+        Only returns a concern if:
+        1. A discovered tag connects to it (tag-triggered), OR
+        2. It was explicitly discovered by the NLU from parent responses.
+
+        This prevents the bot from walking through ALL concerns in a domain
+        sequentially. The bot should only explore what the evidence leads to.
+        """
         processed = state.get("processed_concerns", set())
+        discovered_tags = state.get("discovered_tags", set())
+        triggered_concerns = state.get("triggered_concerns", set())  # concerns explicitly triggered
+
+        # First pass: find concerns that share tags with discovered tags
         for c in domain.concerns:
             key = f"{domain.domain_id}:{c.name}"
-            if key not in processed:
+            if key in processed:
+                continue
+            # Check if any tag from this concern overlaps with discovered tags
+            concern_tags = set(c.all_tags)
+            if concern_tags.intersection(discovered_tags):
+                state["trace_log"].append({
+                    "event": "concern_triggered_by_tags",
+                    "domain": domain.domain_id,
+                    "concern": c.name,
+                    "triggering_tags": sorted(concern_tags.intersection(discovered_tags)),
+                    "reason": "discovered_tags_overlap",
+                })
                 return c
+
+        # Second pass: check if any concern was explicitly triggered by NLU
+        for c in domain.concerns:
+            key = f"{domain.domain_id}:{c.name}"
+            if key in processed:
+                continue
+            if c.name in triggered_concerns:
+                state["trace_log"].append({
+                    "event": "concern_triggered_explicitly",
+                    "domain": domain.domain_id,
+                    "concern": c.name,
+                    "reason": "nlu_discovery",
+                })
+                return c
+
+        # No tag-driven concerns found — do NOT fall back to sequential
         return None
 
     def _route_after_probe(self, state: dict) -> str:
@@ -663,6 +734,7 @@ class OpenlyGraph:
             "intake_fields": {},
             "intake_complete": False,
             "question_cursors": {},
+            "triggered_concerns": set(),
             "bot_message": "",
             "should_end": False,
             "trace_log": [],
