@@ -18,6 +18,7 @@ from typing import Annotated, Any, Literal
 
 from langgraph.graph import END, StateGraph
 
+from .analysis_pipeline import AnalysisReport, run_analysis_pipeline, report_to_trace
 from .cross_domain import CrossDomainEngine, CrossDomainRule, CrossRuleType
 from .domain_data import (
     ClinicalDomain,
@@ -78,9 +79,15 @@ class GraphState:
     # Parent's latest message
     parent_message: str = ""
 
+    # Child demographics
+    child_age_months: int | None = None
+
     # Convergence patterns found
     convergence_hits: list[str] = field(default_factory=list)
     confound_notes: list[str] = field(default_factory=list)
+
+    # Full analysis report (populated by cross-domain pipeline)
+    analysis_report: AnalysisReport | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +226,14 @@ class OpenlyGraph:
             state["domain_queue"] = [d for d in additional if d != primary_domain and d in self.domains]
             if primary_domain not in state.get("explored_domains", []):
                 state.setdefault("explored_domains", []).append(primary_domain)
+
+        # Capture child age if mentioned
+        child_age = classification.get("child_age_months")
+        if child_age is not None:
+            try:
+                state["child_age_months"] = int(child_age)
+            except (ValueError, TypeError):
+                pass
 
         # Capture any intake fields from initial message
         intake_fields = classification.get("intake_fields", {})
@@ -699,53 +714,56 @@ class OpenlyGraph:
     # ------------------------------------------------------------------
 
     def _node_cross_domain_check(self, state: dict) -> dict:
+        """Phase 6: Full cross-domain analysis pipeline.
+
+        Runs the 7-step Implementation Logic:
+          Step 2: Safety check
+          Step 3: Age logic filter
+          Step 4: Convergence patterns (Required vs Supporting)
+          Step 5: Confound rules (linked to convergence)
+          Step 6: Severity escalation (FICICW-aware)
+          Step 7: Differential diagnosis
+        """
         tags = state.get("discovered_tags", set())
         state["_cross_domain_done"] = True
 
-        # Check convergence patterns
-        convergence_hits = []
-        for pattern in self.cross_domain_data.convergence_patterns:
-            all_pattern_tags = set()
-            for tag_list in pattern.domain_tags.values():
-                all_pattern_tags.update(tag_list)
-            matched = tags.intersection(all_pattern_tags)
-            domains_hit = 0
-            for source, domain_tags in pattern.domain_tags.items():
-                if tags.intersection(domain_tags):
-                    domains_hit += 1
-            if domains_hit >= pattern.min_domains_required:
-                convergence_hits.append(f"{pattern.rule_id}: {pattern.pattern_name}")
-                # Queue suggested evaluation domains
-                for domain_id in self.domains:
-                    if domain_id not in state.get("explored_domains", []):
-                        state.setdefault("domain_queue", []).append(domain_id)
+        # Run the full analysis pipeline
+        report = run_analysis_pipeline(
+            discovered_tags=tags,
+            child_age_months=state.get("child_age_months"),
+            intake_fields=state.get("intake_fields", {}),
+            explored_domains=state.get("explored_domains", []),
+            cross_domain_data=self.cross_domain_data,
+        )
 
-        state["convergence_hits"] = convergence_hits
+        # Store the full report for summary generation
+        state["analysis_report"] = report
 
-        # Check confound rules
-        confound_notes = []
-        for rule in self.cross_domain_data.confound_rules:
-            confound_tags = set(rule.confounding_tags)
-            if confound_tags.intersection(tags):
-                confound_notes.append(f"{rule.rule_id}: {rule.confound_name} - {rule.action}")
+        # Update state with pipeline results
+        state["convergence_hits"] = [
+            f"{h.rule_id}: {h.pattern_name} ({h.clinical_hypothesis})"
+            for h in report.convergence_hits
+        ]
+        state["confound_notes"] = [
+            f"{h.rule_id}: {h.confound_name} - {h.action}"
+            for h in report.confound_hits
+        ]
+        state["severity_level"] = report.severity.final_tier
+        if report.safety_triggered:
+            state["safety_escalated"] = True
 
-        state["confound_notes"] = confound_notes
+        # Queue new domains from convergence patterns (evaluation recommendations)
+        for hit in report.convergence_hits:
+            for source_domain in hit.matched_domains:
+                # Try to map source domain name back to domain_id
+                for domain_id, domain in self.domains.items():
+                    if (source_domain.lower() in domain.display_name.lower()
+                            or domain.display_name.lower() in source_domain.lower()):
+                        if domain_id not in state.get("explored_domains", []):
+                            state.setdefault("domain_queue", []).append(domain_id)
 
-        # Severity escalation check
-        for esc in self.cross_domain_data.severity_escalations:
-            if "TIER 0" in esc.escalated_tier.upper() or "IMMEDIATE" in esc.escalated_tier.upper():
-                # Check if safety tags are present
-                condition_tags = set(t.strip() for t in esc.condition.replace("OR", ",").replace("AND", ",").split(",") if t.strip())
-                if tags.intersection(condition_tags):
-                    state["severity_level"] = "high"
-                    state["safety_escalated"] = True
-
-        state["trace_log"].append({
-            "event": "cross_domain_check",
-            "convergence_hits": convergence_hits,
-            "confound_notes": [n.split(":")[0] for n in confound_notes],
-            "severity": state.get("severity_level", "low"),
-        })
+        # Add the full pipeline trace
+        state["trace_log"].append(report_to_trace(report))
 
         return state
 
@@ -760,15 +778,14 @@ class OpenlyGraph:
         intake = state.get("intake_fields", {})
         convergence = state.get("convergence_hits", [])
         confounds = state.get("confound_notes", [])
+        report = state.get("analysis_report")
 
         if state.get("safety_escalated"):
             summary = (
-                "Thank you for sharing this with me. What you've described is very important, "
-                "and I want to make sure your child gets the right support immediately. "
-                "I strongly recommend reaching out to a child psychologist or your pediatrician "
-                "as soon as possible. If there is any immediate safety concern, please contact "
-                "your local emergency services or a crisis helpline. You're doing the right thing "
-                "by speaking up about this."
+                "What you've described needs attention right away. "
+                "Please reach out to a child psychologist or your pediatrician as soon as possible. "
+                "If there's an immediate safety concern, contact your local emergency services or "
+                "a crisis helpline."
             )
         else:
             summary = self.llm.generate_summary(
@@ -778,6 +795,7 @@ class OpenlyGraph:
                 intake_data=redact_payload(intake),
                 convergence_patterns=convergence,
                 confound_notes=confounds,
+                analysis_report=report,
             )
 
         state["bot_message"] = summary
@@ -825,8 +843,10 @@ class OpenlyGraph:
             "should_end": False,
             "trace_log": [],
             "parent_message": "",
+            "child_age_months": None,
             "convergence_hits": [],
             "confound_notes": [],
+            "analysis_report": None,
         }
 
         result = self.graph.invoke(initial_state)
@@ -880,6 +900,7 @@ class OpenlyGraph:
             "session_id": state.get("session_id", ""),
             "phase": state.get("phase", ""),
             "severity_level": state.get("severity_level", ""),
+            "child_age_months": state.get("child_age_months"),
             "active_domain": state.get("active_domain_id", ""),
             "active_concern": state.get("active_concern_name", ""),
             "discovered_tags": sorted(state.get("discovered_tags", set())),

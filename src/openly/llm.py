@@ -257,10 +257,12 @@ Generate your next message (1-2 sentences max, under 30 words, must end with a q
 Generate a brief, professional opening message that:
 1. Introduces yourself as OPenly in one line
 2. Says you'll ask a few questions to understand their child's development
-3. Asks what their main concern is about their child
+3. Asks TWO things: (a) the child's age, and (b) their main concern about the child
 4. 2-3 sentences total. No fluff, no motivational language, no "every child is unique" type filler.
 5. Does NOT claim to be a doctor or diagnostician
-6. Sounds like a professional intake, not a greeting card"""
+6. Sounds like a professional intake, not a greeting card
+7. Example ending: "To start, how old is your child and what's your main concern about their development?"
+"""
 
         try:
             response = self.client.messages.create(
@@ -337,44 +339,107 @@ Generate a natural transition (1-2 sentences):"""
         intake_data: dict[str, str],
         convergence_patterns: list[str],
         confound_notes: list[str],
+        analysis_report: object | None = None,
     ) -> str:
-        """Generate a parent-friendly session summary with referral recommendations."""
+        """Generate a parent-friendly session summary with referral recommendations.
+
+        Uses the full analysis report (convergence, confounds, severity, differentials)
+        when available.
+        """
 
         system_prompt = """You are OPenly, generating a session summary for a parent.
 
 RULES:
-- Be warm, supportive, non-alarming
-- NEVER diagnose. Use phrases like "areas worth exploring further" or "patterns we noticed"
-- Provide generic referral recommendations (e.g., "developmental pediatrician", "speech therapist")
-- Acknowledge the parent's effort in discussing these concerns
-- Keep it concise (4-6 sentences)
-- Use simple language, no clinical jargon
-- Be culturally sensitive for Indian families"""
+- Be professional and clear, not overly warm or vague.
+- NEVER diagnose or label the child. Use phrases like "patterns worth discussing with a specialist" or "areas that may benefit from further evaluation".
+- When convergence patterns are found, explain what areas showed connected patterns (without using clinical names like "CP-ASD-01").
+- When confounds are found, mention that environmental factors may be contributing and what to try first.
+- When differentials exist, note that the patterns could point to different things and a specialist can help clarify.
+- Provide SPECIFIC referral recommendations based on the findings (e.g., "developmental pediatrician for attention concerns", "OT for sensory processing").
+- Keep it concise — 4-6 sentences. No filler.
+- If severity is low and no convergence, say so directly — don't over-pathologize.
+- If confounds are present, emphasize trying environmental changes first before specialist referral."""
+
+        # Build structured findings from the analysis report
+        findings_section = ""
+        if analysis_report is not None:
+            findings = []
+
+            # Age filter
+            age_filter = getattr(analysis_report, 'age_filter', None)
+            if age_filter and age_filter.suppressed_tags:
+                findings.append(
+                    f"Age-adjusted: {len(age_filter.suppressed_tags)} tag(s) suppressed as age-normative"
+                )
+
+            # Convergence
+            conv_hits = getattr(analysis_report, 'convergence_hits', [])
+            if conv_hits:
+                for h in conv_hits:
+                    status = "CONFOUNDED" if h.is_confounded else "ACTIVE"
+                    findings.append(
+                        f"Convergence: {h.pattern_name} — {h.clinical_hypothesis} "
+                        f"(matched {h.domains_matched}/{h.min_domains_required} domains, "
+                        f"confidence: {h.confidence_tier}, status: {status})"
+                    )
+                    if h.recommended_evaluation:
+                        findings.append(f"  → Recommended evaluation: {h.recommended_evaluation}")
+                    if h.confound_details:
+                        findings.append(f"  → Confounds: {'; '.join(h.confound_details)}")
+
+            # Confounds
+            conf_hits = getattr(analysis_report, 'confound_hits', [])
+            if conf_hits:
+                for c in conf_hits:
+                    findings.append(
+                        f"Confound: {c.confound_name} — {c.action}"
+                    )
+                    if c.parent_message:
+                        findings.append(f"  → Parent guidance: {c.parent_message}")
+
+            # Severity reasoning
+            sev = getattr(analysis_report, 'severity', None)
+            if sev and sev.reasoning:
+                for r in sev.reasoning:
+                    findings.append(f"Severity reasoning: {r}")
+
+            # Differentials
+            diffs = getattr(analysis_report, 'differentials', [])
+            if diffs:
+                for d in diffs:
+                    findings.append(
+                        f"Differential: {d.condition_a} vs {d.condition_b} — "
+                        f"leaning toward {'A (' + d.condition_a + ')' if d.leaning == 'A' else 'B (' + d.condition_b + ')' if d.leaning == 'B' else 'unclear'}. "
+                        f"Key differentiator: {d.differentiator}"
+                    )
+
+            if findings:
+                findings_section = "\n\nCLINICAL ANALYSIS FINDINGS:\n" + "\n".join(f"- {f}" for f in findings)
 
         user_prompt = f"""Session data:
 - Severity level: {severity_level}
 - Domains explored: {', '.join(domains_explored)}
-- Key patterns identified: {', '.join(sorted(discovered_tags)[:10])}
+- Key tags: {', '.join(sorted(discovered_tags)[:15])}
 - Intake data: {json.dumps(intake_data)}
-- Convergence patterns noted: {', '.join(convergence_patterns) if convergence_patterns else 'None'}
+- Convergence patterns: {', '.join(convergence_patterns) if convergence_patterns else 'None'}
 - Confound considerations: {', '.join(confound_notes) if confound_notes else 'None'}
+{findings_section}
 
-Generate a parent-friendly summary with generic referral recommendations:"""
+Generate a parent-friendly summary (4-6 sentences) with specific recommendations:"""
 
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=500,
+                max_tokens=400,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
             return response.content[0].text.strip()
         except Exception as e:
             return (
-                "Thank you for sharing your concerns today. Based on our conversation, "
-                "there are some areas of your child's development worth exploring further "
-                "with a professional. We recommend consulting a developmental pediatrician "
-                "for a comprehensive evaluation."
+                "Based on our conversation, there are some areas worth discussing "
+                "with a developmental pediatrician for a closer look. "
+                "We recommend scheduling a consultation at your convenience."
             )
 
     # ------------------------------------------------------------------
@@ -407,11 +472,14 @@ Return this JSON structure:
   "primary_domain": "domain_id",
   "primary_concern": "the presenting concern name from the domain tree that best matches",
   "additional_domains": ["domain_id"],
+  "child_age_months": null,
   "intake_fields": {{"frequency": "...", "intensity": "..."}},
   "safety_flags": []
 }}
 
-Only include fields explicitly mentioned by the parent."""
+IMPORTANT:
+- If the parent mentions the child's age, convert it to months and set child_age_months (e.g. "5 years" = 60, "3.5 years" = 42, "18 months" = 18). Set null if not mentioned.
+- Only include intake_fields explicitly mentioned by the parent."""
 
         try:
             response = self.client.messages.create(
