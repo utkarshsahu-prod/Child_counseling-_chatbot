@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CrossDomainRules",
+  "type": "object",
+  "required": ["rule_id", "rule_type", "trigger_tags", "severity_outcome"],
+  "properties": {
+    "rule_id": {"type": "string"},
+    "rule_type": {
+      "type": "string",
+      "enum": ["convergence", "confound", "severity", "differential", "red_flag"]
+    },
+    "trigger_tags": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "severity_outcome": {
+      "type": "string",
+      "enum": ["low", "mild_concern", "moderate", "high"]
+    },
+    "notes": {"type": "string"}
+  }
+}

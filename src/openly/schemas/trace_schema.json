@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenlyTurnTrace",
+  "type": "object",
+  "required": ["variables_used", "value_updates", "routing_decision", "next_question_reason"],
+  "properties": {
+    "variables_used": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "value_updates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["variable", "old_value", "new_value", "reason"],
+        "properties": {
+          "variable": {"type": "string"},
+          "old_value": {},
+          "new_value": {},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "routing_decision": {"type": "string"},
+    "next_question_reason": {"type": "string"}
+  }
+}

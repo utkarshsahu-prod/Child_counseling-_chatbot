@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DomainTree",
+  "type": "object",
+  "required": ["domain_id", "nodes"],
+  "properties": {
+    "domain_id": {"type": "string"},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["node_id", "question", "tag_ids"],
+        "properties": {
+          "node_id": {"type": "string"},
+          "question": {"type": "string"},
+          "tag_ids": {"type": "array", "items": {"type": "string"}},
+          "next_node_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}
