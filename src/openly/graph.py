@@ -556,32 +556,50 @@ class OpenlyGraph:
         if queue:
             next_domain_id = queue.pop(0)
             old_domain = domain_id or ""
-
-            state["active_domain_id"] = next_domain_id
             state["domain_queue"] = queue
+
+            new_domain = self.domains.get(next_domain_id)
+            if not new_domain or not new_domain.concerns:
+                state["trace_log"].append({
+                    "event": "domain_skipped",
+                    "domain": next_domain_id,
+                    "reason": "no_concerns_in_domain",
+                })
+                return state
+
+            # Use tags + LLM to find the RELEVANT concern in this domain
+            matched_concern_name = self._find_relevant_concern_for_domain(state, new_domain)
+
+            if not matched_concern_name:
+                # No relevant concern - skip this domain entirely
+                state["trace_log"].append({
+                    "event": "domain_skipped",
+                    "domain": next_domain_id,
+                    "reason": "no_relevant_concern_from_conversation_evidence",
+                })
+                return state
+
+            # Found a relevant concern - transition to it
+            state["active_domain_id"] = next_domain_id
+            state["active_concern_name"] = matched_concern_name
 
             if next_domain_id not in state.get("explored_domains", []):
                 state.setdefault("explored_domains", []).append(next_domain_id)
 
-            # Find first concern in new domain
-            new_domain = self.domains.get(next_domain_id)
-            if new_domain and new_domain.concerns:
-                state["active_concern_name"] = new_domain.concerns[0].name
-
-                # Generate transition message
-                transition = self.llm.generate_transition(
-                    from_domain=old_domain,
-                    to_domain=new_domain.display_name,
-                    to_concern=new_domain.concerns[0].name,
-                    conversation_history=state.get("conversation_history", []),
-                )
-                # Prepend transition to next question
-                state["_pending_transition"] = transition
+            transition = self.llm.generate_transition(
+                from_domain=old_domain,
+                to_domain=new_domain.display_name,
+                to_concern=matched_concern_name,
+                conversation_history=state.get("conversation_history", []),
+            )
+            state["_pending_transition"] = transition
 
             state["trace_log"].append({
                 "event": "domain_transition",
                 "from_domain": old_domain,
                 "to_domain": next_domain_id,
+                "matched_concern": matched_concern_name,
+                "reason": "evidence_based_concern_selection",
                 "remaining_queue": list(queue),
             })
             return state
@@ -589,6 +607,74 @@ class OpenlyGraph:
         # Nothing left - time for cross-domain check
         state["trace_log"].append({"event": "all_domains_exhausted"})
         return state
+
+    def _find_relevant_concern_for_domain(
+        self, state: dict, domain: ClinicalDomain
+    ) -> str | None:
+        """Find the most relevant concern in a new domain using tags + LLM.
+
+        1. First check if any discovered tags overlap with a concern in this domain.
+        2. If no tag overlap, ask the LLM to match based on conversation context.
+        3. Returns None if no concern is relevant (domain should be skipped).
+        """
+        discovered_tags = state.get("discovered_tags", set())
+        processed = state.get("processed_concerns", set())
+
+        # Pass 1: Tag-based matching
+        best_match = None
+        best_overlap = 0
+        for c in domain.concerns:
+            key = f"{domain.domain_id}:{c.name}"
+            if key in processed:
+                continue
+            concern_tags = set(c.all_tags)
+            overlap = len(concern_tags.intersection(discovered_tags))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_match = c
+
+        if best_match:
+            state["trace_log"].append({
+                "event": "concern_matched_by_tags",
+                "domain": domain.domain_id,
+                "concern": best_match.name,
+                "overlapping_tags": sorted(set(best_match.all_tags).intersection(discovered_tags)),
+            })
+            return best_match.name
+
+        # Pass 2: LLM-based matching using conversation context
+        available_concerns = [
+            c.name for c in domain.concerns
+            if f"{domain.domain_id}:{c.name}" not in processed
+        ]
+        if not available_concerns:
+            return None
+
+        # Build conversation summary for the LLM
+        history = state.get("conversation_history", [])
+        summary_parts = []
+        for msg in history[-8:]:
+            role = "Parent" if msg.get("role") == "user" else "Counselor"
+            summary_parts.append(f"{role}: {msg.get('content', '')[:150]}")
+        conv_summary = "\n".join(summary_parts)
+
+        matched = self.llm.match_concern_for_domain(
+            domain_name=domain.display_name,
+            available_concerns=available_concerns,
+            conversation_summary=conv_summary,
+            discovered_tags=sorted(discovered_tags),
+        )
+
+        if matched:
+            state["trace_log"].append({
+                "event": "concern_matched_by_llm",
+                "domain": domain.domain_id,
+                "concern": matched,
+                "reason": "llm_conversation_context_match",
+            })
+            return matched
+
+        return None
 
     def _route_after_transition(self, state: dict) -> str:
         # If we have a new domain queued, continue probing

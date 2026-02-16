@@ -423,3 +423,64 @@ Only include fields explicitly mentioned by the parent."""
                 "intake_fields": {},
                 "safety_flags": [],
             }
+
+    # ------------------------------------------------------------------
+    # NLU: Match concern when transitioning to a queued domain
+    # ------------------------------------------------------------------
+
+    def match_concern_for_domain(
+        self,
+        domain_name: str,
+        available_concerns: list[str],
+        conversation_summary: str,
+        discovered_tags: list[str],
+    ) -> str | None:
+        """Identify the most relevant concern in a new domain based on conversation context.
+
+        Returns the concern name or None if no concern is relevant.
+        """
+        concern_list = "\n".join(f"  - {c}" for c in available_concerns)
+
+        system_prompt = """You are the NLU component of OPenly, a child developmental chatbot.
+Given a conversation summary and the tags discovered so far, identify which presenting
+concern in the new domain is MOST relevant to explore. Only pick a concern if there is
+genuine evidence from the conversation that warrants exploring it.
+Return ONLY valid JSON, no markdown."""
+
+        user_prompt = f"""Domain to explore: {domain_name}
+
+Available concerns in this domain:
+{concern_list}
+
+Summary of conversation so far: {conversation_summary}
+
+Tags discovered: {', '.join(discovered_tags)}
+
+Return this JSON:
+{{
+  "selected_concern": "exact concern name from the list above, or null if none are relevant",
+  "reason": "1-sentence explanation of why this concern connects to what the parent shared"
+}}
+
+IMPORTANT: Only select a concern if the conversation evidence genuinely connects to it.
+If nothing from the conversation relates to any concern in this domain, return null."""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=256,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = response.content[0].text.strip()
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\n?", "", cleaned)
+                cleaned = re.sub(r"\n?```$", "", cleaned)
+            data = json.loads(cleaned.strip())
+            selected = data.get("selected_concern")
+            if selected and selected != "null" and selected.lower() != "none":
+                return selected
+            return None
+        except Exception:
+            return None
