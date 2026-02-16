@@ -13,6 +13,14 @@ from .contracts import CONTRACT_VERSIONS, ContractValidationResult, validate_con
 from .readiness import ReadinessGateResult, ReadinessReport, run_readiness_review
 from .severity import SeverityEngine, SeverityRule
 from .state_schema import BranchState, ConversationState, DomainBranch, SeverityLevel
+from .domain_data import (
+    ClinicalDomain,
+    CrossDomainData,
+    PresentingConcern,
+    ResponseTrigger,
+    load_all_domains,
+    load_cross_domain_data,
+)
 
 __all__ = [
     "BranchState",
@@ -53,4 +61,10 @@ __all__ = [
     "ReadinessGateResult",
     "ReadinessReport",
     "run_readiness_review",
+    "ClinicalDomain",
+    "CrossDomainData",
+    "PresentingConcern",
+    "ResponseTrigger",
+    "load_all_domains",
+    "load_cross_domain_data",
 ]
