@@ -209,6 +209,11 @@ def _cell(row: tuple, idx: int) -> str:
     return _s(row[idx])
 
 
+def _normalize_quotes(s: str) -> str:
+    """Replace Unicode curly/smart quotes with ASCII straight quotes."""
+    return s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+
+
 # ---------------------------------------------------------------------------
 # Domain tree parser
 # ---------------------------------------------------------------------------
@@ -271,7 +276,7 @@ def load_all_domains(workbook_path: Path | str) -> list[ClinicalDomain]:
 
             # New presenting concern
             if concern_text:
-                current_concern = PresentingConcern(name=concern_text)
+                current_concern = PresentingConcern(name=_normalize_quotes(concern_text))
                 domain.concerns.append(current_concern)
                 current_question = None
 

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from anthropic import Anthropic
 
-from .domain_data import ClinicalDomain, PresentingConcern
+from .domain_data import ClinicalDomain, DomainQuestion, PresentingConcern
 
 
 # ---------------------------------------------------------------------------
@@ -56,12 +56,27 @@ class OpenlyLLM:
         active_concern: PresentingConcern | None,
         all_known_tags: set[str],
         conversation_history: list[dict[str, str]],
+        current_question: DomainQuestion | None = None,
     ) -> NLUResult:
-        """Analyze parent response and extract AI tags, intake fields, safety flags."""
+        """Analyze parent response and extract AI tags, intake fields, safety flags.
+
+        When *current_question* is provided the prompt and post-hoc filter are
+        scoped to ONLY that question's triggers/tags.  This ensures tags are
+        assigned through the question→answer→tag flow, not broadly inferred.
+        """
 
         # Build the tag reference for the prompt
         tag_context = ""
-        if active_domain and active_concern:
+        if current_question:
+            # Scoped mode: only show the current question's triggers
+            tag_context = f"\nActive domain: {active_domain.display_name}\n" if active_domain else ""
+            tag_context += f"Active concern: {active_concern.name}\n" if active_concern else ""
+            tag_context += f"Question just asked: \"{current_question.question_text}\"\n"
+            tag_context += "Valid response triggers for THIS question ONLY:\n"
+            for t in current_question.triggers:
+                if t.ai_tag:
+                    tag_context += f"  - Trigger: \"{t.trigger_text}\" -> Tag: {t.ai_tag}\n"
+        elif active_domain and active_concern:
             tag_context = f"\nActive domain: {active_domain.display_name}\n"
             tag_context += f"Active concern: {active_concern.name}\n"
             tag_context += "Possible tags for this concern:\n"
@@ -74,6 +89,15 @@ class OpenlyLLM:
             tag_context += "Available tags in this domain:\n"
             for tag in sorted(active_domain.all_tags)[:50]:
                 tag_context += f"  - {tag}\n"
+
+        # Compute allowed tags for post-hoc filtering
+        allowed_tags: set[str] | None = None
+        if current_question:
+            allowed_tags = {
+                t.ai_tag.strip().lower().replace("-", "_").replace(" ", "_")
+                for t in current_question.triggers
+                if t.ai_tag
+            }
 
         # Build conversation context (last 6 turns max)
         recent_turns = conversation_history[-6:] if len(conversation_history) > 6 else conversation_history
@@ -128,12 +152,21 @@ Only include intake_fields that are explicitly mentioned. Only include discovere
                 messages=[{"role": "user", "content": user_prompt}],
             )
             raw = response.content[0].text.strip()
-            return self._parse_nlu_response(raw, all_known_tags)
+            return self._parse_nlu_response(raw, all_known_tags, allowed_tags=allowed_tags)
         except Exception as e:
             return NLUResult(raw_llm_response=f"ERROR: {e}")
 
-    def _parse_nlu_response(self, raw: str, all_known_tags: set[str]) -> NLUResult:
-        """Parse and validate LLM JSON response."""
+    def _parse_nlu_response(
+        self,
+        raw: str,
+        all_known_tags: set[str],
+        allowed_tags: set[str] | None = None,
+    ) -> NLUResult:
+        """Parse and validate LLM JSON response.
+
+        When *allowed_tags* is provided, only tags in that set are kept.
+        This enforces question-scoped tag assignment during probing.
+        """
         result = NLUResult(raw_llm_response=raw)
 
         # Strip markdown code fences if present
@@ -148,11 +181,18 @@ Only include intake_fields that are explicitly mentioned. Only include discovere
         except json.JSONDecodeError:
             return result
 
-        result.matched_tags = [
+        # Normalize tags
+        normalized_tags = [
             str(t).strip().lower().replace("-", "_").replace(" ", "_")
             for t in data.get("matched_tags", [])
             if t
         ]
+        # Post-hoc filter: if allowed_tags is set, only keep tags from the current question
+        if allowed_tags is not None:
+            result.matched_tags = [t for t in normalized_tags if t in allowed_tags]
+        else:
+            result.matched_tags = normalized_tags
+
         result.discovered_domains = [
             str(d).strip().lower()
             for d in data.get("discovered_domains", [])
@@ -170,6 +210,125 @@ Only include intake_fields that are explicitly mentioned. Only include discovere
         ]
 
         return result
+
+    # ------------------------------------------------------------------
+    # NLU: Check if intake answers already cover a probing question
+    # ------------------------------------------------------------------
+
+    def check_intake_coverage(
+        self,
+        question: DomainQuestion,
+        intake_fields: dict[str, str],
+        conversation_history: list[dict[str, str]],
+    ) -> dict | None:
+        """Check if prior intake answers already cover a probing question's triggers.
+
+        Returns a dict with ``covered=True``, the matching ``tag``, and a
+        ``summary`` the bot can present for confirmation — or *None* if the
+        intake does not provide enough information.
+        """
+        if not intake_fields:
+            return None
+
+        trigger_list = "\n".join(
+            f"  - Trigger: \"{t.trigger_text}\" -> Tag: {t.ai_tag}"
+            for t in question.triggers if t.ai_tag
+        )
+        if not trigger_list:
+            return None
+
+        intake_summary = "\n".join(
+            f"  {k}: {v}" for k, v in intake_fields.items()
+        )
+
+        recent = conversation_history[-6:] if len(conversation_history) > 6 else conversation_history
+        conv_context = "\n".join(
+            f"{'Parent' if t.get('role') == 'user' else 'Counselor'}: {t.get('content', '')}"
+            for t in recent
+        )
+
+        system_prompt = """You are the NLU component of OPenly, a child developmental chatbot.
+Determine whether the parent's prior intake answers already provide enough information
+to answer a specific probing question. Return ONLY valid JSON, no markdown.
+
+RULES:
+1. Only say covered=true if the intake clearly addresses the question's trigger patterns.
+2. If covered, pick the BEST matching trigger tag and write a SHORT summary (under 25 words)
+   of what the parent said, phrased as a confirmation question.
+3. Be conservative — only mark covered if there is clear, direct evidence."""
+
+        user_prompt = f"""Probing question: "{question.question_text}"
+
+Triggers for this question:
+{trigger_list}
+
+Intake data collected so far:
+{intake_summary}
+
+Conversation context:
+{conv_context}
+
+Return this JSON:
+{{
+  "covered": true/false,
+  "matched_tag": "exact_tag_name or null",
+  "summary": "Short confirmation question for the parent, or null"
+}}"""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=256,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = response.content[0].text.strip()
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\n?", "", cleaned)
+                cleaned = re.sub(r"\n?```$", "", cleaned)
+            data = json.loads(cleaned.strip())
+            if data.get("covered"):
+                tag = data.get("matched_tag")
+                summary = data.get("summary")
+                if tag and summary:
+                    # Validate tag is actually from this question
+                    valid_tags = {
+                        t.ai_tag.strip().lower().replace("-", "_").replace(" ", "_")
+                        for t in question.triggers if t.ai_tag
+                    }
+                    norm_tag = str(tag).strip().lower().replace("-", "_").replace(" ", "_")
+                    if norm_tag in valid_tags:
+                        return {"covered": True, "tag": norm_tag, "summary": summary}
+            return None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # NLU: Check if parent's response confirms a pre-answered question
+    # ------------------------------------------------------------------
+
+    def check_confirmation(self, parent_message: str) -> bool:
+        """Return True if the parent's message is an affirmative confirmation."""
+        system_prompt = """Determine if the parent's message is an affirmative confirmation (yes, okay, correct, that's right, etc.) or a denial/correction.
+Return ONLY valid JSON: {"confirmed": true} or {"confirmed": false}"""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=30,
+                system=system_prompt,
+                messages=[{"role": "user", "content": f'Parent says: "{parent_message}"'}],
+            )
+            raw = response.content[0].text.strip()
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\n?", "", cleaned)
+                cleaned = re.sub(r"\n?```$", "", cleaned)
+            data = json.loads(cleaned.strip())
+            return bool(data.get("confirmed", False))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # NLG: Generate natural questions and transitions

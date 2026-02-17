@@ -51,6 +51,43 @@ class TestNLUResponseParsing(unittest.TestCase):
         self.assertEqual(len(result.safety_flags), 2)
         self.assertIn("self_harm_signals", result.safety_flags)
 
+    # --- Tests for question-scoped tag filtering (allowed_tags) ---
+
+    def _parse_with_allowed(self, raw: str, allowed_tags: set[str]) -> NLUResult:
+        """Parse with allowed_tags filter applied."""
+        llm = object.__new__(OpenlyLLM)
+        return llm._parse_nlu_response(
+            raw,
+            all_known_tags={"tag_a", "tag_b", "tag_c", "tag_d"},
+            allowed_tags=allowed_tags,
+        )
+
+    def test_allowed_tags_filters_to_question_scope(self):
+        """Only tags from the current question's triggers should survive."""
+        raw = '{"matched_tags": ["tag_a", "tag_b", "tag_c"], "discovered_domains": [], "intake_fields": {}, "safety_flags": []}'
+        result = self._parse_with_allowed(raw, allowed_tags={"tag_a", "tag_c"})
+        self.assertEqual(result.matched_tags, ["tag_a", "tag_c"])
+
+    def test_allowed_tags_rejects_all_when_none_match(self):
+        raw = '{"matched_tags": ["tag_b", "tag_d"], "discovered_domains": [], "intake_fields": {}, "safety_flags": []}'
+        result = self._parse_with_allowed(raw, allowed_tags={"tag_a"})
+        self.assertEqual(result.matched_tags, [])
+
+    def test_allowed_tags_none_means_no_filtering(self):
+        """When allowed_tags is None, all tags pass through (backward compat)."""
+        raw = '{"matched_tags": ["tag_a", "tag_b"], "discovered_domains": [], "intake_fields": {}, "safety_flags": []}'
+        result = self._parse(raw)  # uses default (no allowed_tags)
+        self.assertEqual(result.matched_tags, ["tag_a", "tag_b"])
+
+    def test_allowed_tags_does_not_affect_other_fields(self):
+        """allowed_tags only filters matched_tags, not domains/intake/safety."""
+        raw = '{"matched_tags": ["tag_a", "tag_b"], "discovered_domains": ["behavioral_development"], "intake_fields": {"frequency": "daily"}, "safety_flags": ["self_harm_signals"]}'
+        result = self._parse_with_allowed(raw, allowed_tags={"tag_a"})
+        self.assertEqual(result.matched_tags, ["tag_a"])
+        self.assertEqual(result.discovered_domains, ["behavioral_development"])
+        self.assertEqual(result.intake_fields, {"frequency": "daily"})
+        self.assertEqual(result.safety_flags, ["self_harm_signals"])
+
 
 if __name__ == "__main__":
     unittest.main()

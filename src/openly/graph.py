@@ -259,6 +259,17 @@ class OpenlyGraph:
 
         return state
 
+    def _get_active_concern(self, state: dict) -> PresentingConcern | None:
+        """Look up the active concern object from state."""
+        domain_id = state.get("active_domain_id")
+        concern_name = state.get("active_concern_name")
+        domain = self.domains.get(domain_id) if domain_id else None
+        if domain and concern_name:
+            for c in domain.concerns:
+                if c.name.lower() == concern_name.lower():
+                    return c
+        return None
+
     def _validate_concern_name(self, llm_concern: str, domain: ClinicalDomain) -> str:
         """Validate and resolve an LLM-returned concern name against actual domain concerns.
 
@@ -424,7 +435,8 @@ class OpenlyGraph:
                 "value": parent_msg.strip()[:100],
             })
 
-        # Also run NLU extraction to capture any tags mentioned during intake
+        # Run NLU extraction during intake ONLY for domain discovery (no tag assignment).
+        # Tags are assigned only during the probing phase via question→answer→tag flow.
         domain_id = state.get("active_domain_id")
         active_domain = self.domains.get(domain_id) if domain_id else None
         concern_name = state.get("active_concern_name")
@@ -442,8 +454,8 @@ class OpenlyGraph:
             all_known_tags=self._all_known_tags,
             conversation_history=state.get("conversation_history", []),
         )
-        if nlu_result.matched_tags:
-            state.setdefault("discovered_tags", set()).update(nlu_result.matched_tags)
+        # Do NOT assign tags during intake — tags come only from probing questions.
+        # Only use NLU to discover new domains to queue.
         if nlu_result.discovered_domains:
             for new_domain in nlu_result.discovered_domains:
                 if new_domain in self.domains and new_domain not in state.get("explored_domains", []):
@@ -483,7 +495,7 @@ class OpenlyGraph:
                 # Update state with the validated name
                 state["active_concern_name"] = concern.name
 
-        # If still no match after validation, the concern doesn't exist in this domain
+        # If still no match after validation, try LLM-based re-matching
         if not concern:
             state["trace_log"].append({
                 "event": "concern_not_found_in_domain",
@@ -491,6 +503,19 @@ class OpenlyGraph:
                 "attempted_concern": concern_name,
                 "available_concerns": [c.name for c in domain.concerns[:10]],
             })
+            # Re-match using conversation context and LLM
+            rematch_name = self._find_relevant_concern_for_domain(state, domain)
+            if rematch_name:
+                for c in domain.concerns:
+                    if c.name == rematch_name:
+                        concern = c
+                        state["active_concern_name"] = concern.name
+                        state["trace_log"].append({
+                            "event": "concern_rematched_by_llm",
+                            "domain": domain_id,
+                            "rematched_concern": concern.name,
+                        })
+                        break
 
         if not concern or not concern.questions:
             state["should_end"] = True
@@ -542,8 +567,46 @@ class OpenlyGraph:
         question_obj = concern.questions[cursor]
         state.setdefault("question_cursors", {})[cursor_key] = cursor + 1
 
+        # --- Intake-coverage check ---
+        # If the parent already provided information during intake that covers
+        # this question's triggers, present a confirmation instead of asking
+        # the question fresh.
+        intake_fields = state.get("intake_fields", {})
+        coverage = self.llm.check_intake_coverage(
+            question=question_obj,
+            intake_fields=intake_fields,
+            conversation_history=state.get("conversation_history", []),
+        )
+
+        pending_transition = state.pop("_pending_transition", None)
+
+        if coverage:
+            # The intake already covers this question — ask for confirmation
+            confirmation_msg = coverage["summary"]
+            if pending_transition:
+                confirmation_msg = pending_transition + " " + confirmation_msg
+
+            state["bot_message"] = confirmation_msg
+            state["conversation_history"].append({"role": "assistant", "content": confirmation_msg})
+            state["phase"] = "confirming"
+            # Store what we're confirming so we can assign the tag on "yes"
+            state["_pending_confirmation"] = {
+                "tag": coverage["tag"],
+                "question": question_obj,
+            }
+            state["trace_log"].append({
+                "event": "intake_coverage_confirmation",
+                "domain": domain_id,
+                "concern": concern.name,
+                "base_question": question_obj.question_text,
+                "pending_tag": coverage["tag"],
+                "cursor": cursor,
+            })
+            return state
+
+        # --- Normal flow: ask the question fresh ---
         # Check intake status for enriching the question
-        intake = PrimaryConcernIntake(fields=dict(state.get("intake_fields", {})))
+        intake = PrimaryConcernIntake(fields=dict(intake_fields))
         intake_status = {
             "is_complete": intake.is_complete,
             "missing_fields": intake.missing_fields(),
@@ -558,14 +621,15 @@ class OpenlyGraph:
             intake_status=intake_status,
         )
 
-        # Prepend transition message if switching concerns/domains
-        pending_transition = state.pop("_pending_transition", None)
         if pending_transition:
             natural_question = pending_transition + " " + natural_question
 
         state["bot_message"] = natural_question
         state["conversation_history"].append({"role": "assistant", "content": natural_question})
         state["phase"] = "probing"
+        # Store the current question object so _node_analyze_response can scope
+        # tag extraction to THIS question's triggers only.
+        state["_current_probe_question"] = question_obj
         state["trace_log"].append({
             "event": "question_asked",
             "domain": domain_id,
@@ -652,13 +716,18 @@ class OpenlyGraph:
                     active_concern = c
                     break
 
-        # NLU extraction
+        # Retrieve the question that was just asked (set by _node_probe_domain)
+        # so tag extraction is scoped to THAT question's triggers only.
+        current_question = state.pop("_current_probe_question", None)
+
+        # NLU extraction — scoped to the current question when available
         nlu_result = self.llm.extract_tags(
             parent_message=parent_msg,
             active_domain=active_domain,
             active_concern=active_concern,
             all_known_tags=self._all_known_tags,
             conversation_history=state.get("conversation_history", []),
+            current_question=current_question,
         )
 
         # Update state with NLU results
@@ -1047,6 +1116,44 @@ class OpenlyGraph:
             if state.get("phase") == "intake_done":
                 # All intake collected — start probing
                 state = self._node_probe_domain(state)
+            return state
+
+        if state.get("phase") == "confirming":
+            # Parent is responding to a confirmation of pre-answered info
+            state["conversation_history"].append({"role": "user", "content": parent_message})
+            pending = state.pop("_pending_confirmation", None)
+            if pending and self.llm.check_confirmation(parent_message):
+                # Parent confirmed — assign the tag
+                state.setdefault("discovered_tags", set()).add(pending["tag"])
+                state["trace_log"].append({
+                    "event": "confirmation_accepted",
+                    "tag": pending["tag"],
+                    "base_question": pending["question"].question_text,
+                })
+            else:
+                # Parent denied or corrected — ask the question fresh
+                # The cursor already advanced, so we need to re-ask this question.
+                # We do this by running analyze_response on their correction
+                # (which may contain the real answer) and then continuing.
+                if pending:
+                    current_question = pending["question"]
+                    nlu_result = self.llm.extract_tags(
+                        parent_message=parent_message,
+                        active_domain=self.domains.get(state.get("active_domain_id")),
+                        active_concern=self._get_active_concern(state),
+                        all_known_tags=self._all_known_tags,
+                        conversation_history=state.get("conversation_history", []),
+                        current_question=current_question,
+                    )
+                    if nlu_result.matched_tags:
+                        state.setdefault("discovered_tags", set()).update(nlu_result.matched_tags)
+                    state["trace_log"].append({
+                        "event": "confirmation_denied",
+                        "base_question": current_question.question_text,
+                        "extracted_tags": nlu_result.matched_tags,
+                    })
+            # Continue to next question
+            state = self._node_probe_domain(state)
             return state
 
         # For subsequent messages - run analysis then continue flow
