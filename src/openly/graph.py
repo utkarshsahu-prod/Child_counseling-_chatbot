@@ -141,7 +141,11 @@ class OpenlyGraph:
             self._route_after_classify,
             {"gather_intake": "gather_intake", "end": END},
         )
-        builder.add_edge("gather_intake", "probe_domain")
+        builder.add_conditional_edges(
+            "gather_intake",
+            self._route_after_intake,
+            {"wait_for_input": END, "probe_domain": "probe_domain"},
+        )
         builder.add_conditional_edges(
             "probe_domain",
             self._route_after_probe,
@@ -193,14 +197,14 @@ class OpenlyGraph:
 
         state["conversation_history"].append({"role": "user", "content": parent_msg})
 
-        # Build domain reference for LLM
+        # Build domain reference for LLM — include ALL concern names
         available = []
         for did, d in self.domains.items():
-            sample_concerns = ", ".join(c.name for c in d.concerns[:5])
+            all_concerns = ", ".join(f'"{c.name}"' for c in d.concerns)
             available.append({
                 "domain_id": did,
                 "display_name": d.display_name,
-                "sample_concerns": sample_concerns,
+                "all_concerns": all_concerns,
             })
 
         classification = self.llm.classify_initial_concern(parent_msg, available)
@@ -221,8 +225,12 @@ class OpenlyGraph:
 
         # Set active domain
         if primary_domain and primary_domain in self.domains:
+            domain = self.domains[primary_domain]
+
+            # Validate concern name against actual concerns in this domain
+            validated_concern = self._validate_concern_name(primary_concern, domain)
             state["active_domain_id"] = primary_domain
-            state["active_concern_name"] = primary_concern
+            state["active_concern_name"] = validated_concern
             state["domain_queue"] = [d for d in additional if d != primary_domain and d in self.domains]
             if primary_domain not in state.get("explored_domains", []):
                 state.setdefault("explored_domains", []).append(primary_domain)
@@ -251,6 +259,59 @@ class OpenlyGraph:
 
         return state
 
+    def _validate_concern_name(self, llm_concern: str, domain: ClinicalDomain) -> str:
+        """Validate and resolve an LLM-returned concern name against actual domain concerns.
+
+        Returns the exact concern name from the domain tree.
+        Falls back to the first concern ONLY if nothing matches at all.
+        """
+        if not llm_concern:
+            return domain.concerns[0].name if domain.concerns else ""
+
+        # 1. Exact match (case-insensitive)
+        for c in domain.concerns:
+            if c.name.lower().strip() == llm_concern.lower().strip():
+                return c.name
+
+        # 2. Exact match ignoring quotes and special chars
+        def _normalize(s: str) -> str:
+            return s.lower().replace('"', '').replace("'", "").replace(""", "").replace(""", "").strip()
+
+        for c in domain.concerns:
+            if _normalize(c.name) == _normalize(llm_concern):
+                return c.name
+
+        # 3. Substring match — LLM name contains a concern name or vice versa
+        llm_lower = llm_concern.lower().strip()
+        best_match = None
+        best_score = 0
+        for c in domain.concerns:
+            c_lower = c.name.lower().strip()
+            # Check both directions
+            if c_lower in llm_lower or llm_lower in c_lower:
+                score = len(c_lower)  # longer match = better
+                if score > best_score:
+                    best_score = score
+                    best_match = c
+
+        if best_match:
+            return best_match.name
+
+        # 4. Word overlap scoring
+        llm_words = set(llm_lower.replace("/", " ").replace("-", " ").split())
+        for c in domain.concerns:
+            c_words = set(c.name.lower().replace("/", " ").replace("-", " ").split())
+            overlap = len(llm_words.intersection(c_words))
+            if overlap > best_score:
+                best_score = overlap
+                best_match = c
+
+        if best_match and best_score >= 2:
+            return best_match.name
+
+        # 5. Last resort — return LLM's name as-is (probe_domain will handle no-match)
+        return llm_concern
+
     def _route_after_classify(self, state: dict) -> str:
         if state.get("safety_escalated"):
             return "end"
@@ -259,22 +320,142 @@ class OpenlyGraph:
         return "end"
 
     # ------------------------------------------------------------------
-    # Node: Gather Intake (Phase 2 - FICICW)
+    # Node: Gather Intake (Phase 2 - Age + FICICW)
     # ------------------------------------------------------------------
 
-    def _node_gather_intake(self, state: dict) -> dict:
-        intake = PrimaryConcernIntake(fields=dict(state.get("intake_fields", {})))
-        missing = intake.missing_fields()
+    # Intake fields to collect, in order. Age first, then FICICW.
+    _INTAKE_SEQUENCE = [
+        "child_age",
+        "frequency",
+        "intensity",
+        "current_methods",
+        "where_happening",
+        "life_impact",
+    ]
 
-        state["intake_complete"] = intake.is_complete
+    def _node_gather_intake(self, state: dict) -> dict:
+        """Ask the next missing intake question (age first, then FICICW).
+
+        This node is called:
+        1. Right after classify_concern (first time) — asks the first missing field.
+        2. After the parent responds to an intake question — processes the response,
+           then asks the next missing field or transitions to probing.
+        """
+        concern_name = state.get("active_concern_name", "")
+
+        # Determine what's still missing
+        missing = self._get_missing_intake_fields(state)
+
+        if not missing:
+            # All intake collected — mark complete and move on
+            state["intake_complete"] = True
+            state["phase"] = "intake_done"
+            state["trace_log"].append({
+                "event": "intake_complete",
+                "captured": self._get_captured_intake_fields(state),
+            })
+            return state
+
+        # Ask the next missing field
+        next_field = missing[0]
+        question = self.llm.generate_intake_question(
+            field_name=next_field,
+            concern_name=concern_name,
+            conversation_history=state.get("conversation_history", []),
+        )
+
+        state["bot_message"] = question
+        state["conversation_history"].append({"role": "assistant", "content": question})
         state["phase"] = "intake"
+        state["_current_intake_field"] = next_field
         state["trace_log"].append({
-            "event": "intake_check",
-            "complete": intake.is_complete,
-            "missing": missing,
-            "captured": sorted(intake.as_dict().keys()),
+            "event": "intake_question_asked",
+            "field": next_field,
+            "missing_fields": missing,
+            "captured": self._get_captured_intake_fields(state),
         })
         return state
+
+    def _get_missing_intake_fields(self, state: dict) -> list[str]:
+        """Return ordered list of intake fields still needed."""
+        missing = []
+        for field_name in self._INTAKE_SEQUENCE:
+            if field_name == "child_age":
+                if state.get("child_age_months") is None:
+                    missing.append("child_age")
+            else:
+                if field_name not in state.get("intake_fields", {}):
+                    missing.append(field_name)
+        return missing
+
+    def _get_captured_intake_fields(self, state: dict) -> list[str]:
+        """Return list of intake fields already captured."""
+        captured = list(state.get("intake_fields", {}).keys())
+        if state.get("child_age_months") is not None:
+            captured.append(f"child_age={state['child_age_months']}mo")
+        return sorted(captured)
+
+    def _process_intake_response(self, state: dict) -> dict:
+        """Process the parent's response to an intake question."""
+        parent_msg = state.get("parent_message", "")
+        if not parent_msg:
+            return state
+
+        state["conversation_history"].append({"role": "user", "content": parent_msg})
+
+        current_field = state.pop("_current_intake_field", None)
+
+        if current_field == "child_age":
+            # Extract age using LLM
+            age = self.llm.extract_age_from_response(parent_msg)
+            if age is not None:
+                state["child_age_months"] = age
+            state["trace_log"].append({
+                "event": "intake_response",
+                "field": "child_age",
+                "extracted_age_months": age,
+            })
+        elif current_field:
+            # Store the FICICW field value directly
+            state.setdefault("intake_fields", {})[current_field] = parent_msg.strip()
+            state["trace_log"].append({
+                "event": "intake_response",
+                "field": current_field,
+                "value": parent_msg.strip()[:100],
+            })
+
+        # Also run NLU extraction to capture any tags mentioned during intake
+        domain_id = state.get("active_domain_id")
+        active_domain = self.domains.get(domain_id) if domain_id else None
+        concern_name = state.get("active_concern_name")
+        active_concern = None
+        if active_domain and concern_name:
+            for c in active_domain.concerns:
+                if c.name.lower() == concern_name.lower():
+                    active_concern = c
+                    break
+
+        nlu_result = self.llm.extract_tags(
+            parent_message=parent_msg,
+            active_domain=active_domain,
+            active_concern=active_concern,
+            all_known_tags=self._all_known_tags,
+            conversation_history=state.get("conversation_history", []),
+        )
+        if nlu_result.matched_tags:
+            state.setdefault("discovered_tags", set()).update(nlu_result.matched_tags)
+        if nlu_result.discovered_domains:
+            for new_domain in nlu_result.discovered_domains:
+                if new_domain in self.domains and new_domain not in state.get("explored_domains", []):
+                    state.setdefault("domain_queue", []).append(new_domain)
+
+        return state
+
+    def _route_after_intake(self, state: dict) -> str:
+        """Route after intake: keep asking if fields missing, else probe."""
+        if state.get("phase") == "intake_done":
+            return "probe_domain"
+        return "wait_for_input"
 
     # ------------------------------------------------------------------
     # Node: Probe Domain (Phase 3)
@@ -290,29 +471,26 @@ class OpenlyGraph:
 
         domain = self.domains[domain_id]
 
-        # Find the active concern in the domain
+        # Find the active concern in the domain using validated matching
         concern = None
         if concern_name:
+            validated_name = self._validate_concern_name(concern_name, domain)
             for c in domain.concerns:
-                if c.name.lower() == concern_name.lower():
+                if c.name == validated_name:
                     concern = c
                     break
-            # Fuzzy match if exact didn't work
-            if not concern:
-                for c in domain.concerns:
-                    if concern_name.lower() in c.name.lower() or c.name.lower() in concern_name.lower():
-                        concern = c
-                        break
+            if concern and concern.name != concern_name:
+                # Update state with the validated name
+                state["active_concern_name"] = concern.name
 
-        # If no concern matched, use first unprocessed concern
+        # If still no match after validation, the concern doesn't exist in this domain
         if not concern:
-            processed = state.get("processed_concerns", set())
-            for c in domain.concerns:
-                key = f"{domain_id}:{c.name}"
-                if key not in processed:
-                    concern = c
-                    state["active_concern_name"] = c.name
-                    break
+            state["trace_log"].append({
+                "event": "concern_not_found_in_domain",
+                "domain": domain_id,
+                "attempted_concern": concern_name,
+                "available_concerns": [c.name for c in domain.concerns[:10]],
+            })
 
         if not concern or not concern.questions:
             state["should_end"] = True
@@ -860,6 +1038,16 @@ class OpenlyGraph:
             # First message - classify concern
             result = self.graph.invoke(state)
             return result
+
+        if state.get("phase") == "intake":
+            # Parent is answering an intake question (age or FICICW)
+            state = self._process_intake_response(state)
+            # Ask next missing field or transition to probing
+            state = self._node_gather_intake(state)
+            if state.get("phase") == "intake_done":
+                # All intake collected — start probing
+                state = self._node_probe_domain(state)
+            return state
 
         # For subsequent messages - run analysis then continue flow
         state = self._node_analyze_response(state)

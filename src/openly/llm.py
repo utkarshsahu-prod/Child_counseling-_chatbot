@@ -454,15 +454,16 @@ Generate a parent-friendly summary (4-6 sentences) with specific recommendations
         """Classify the parent's initial concern into domain(s) and presenting concern(s)."""
 
         domain_list = "\n".join(
-            f"  - {d['domain_id']}: {d['display_name']} (concerns: {d['sample_concerns']})"
+            f"  - {d['domain_id']}: {d['display_name']}\n    Concerns: {d['all_concerns']}"
             for d in available_domains
         )
 
         system_prompt = """You are the NLU component of OPenly, a child developmental chatbot.
 Analyze the parent's initial concern and classify it into the most relevant domain(s) and presenting concern(s).
+CRITICAL: The primary_concern MUST be an EXACT concern name from the list below. Copy it exactly as written.
 Return ONLY valid JSON, no markdown."""
 
-        user_prompt = f"""Available domains:
+        user_prompt = f"""Available domains and their concerns:
 {domain_list}
 
 Parent says: "{parent_message}"
@@ -470,7 +471,7 @@ Parent says: "{parent_message}"
 Return this JSON structure:
 {{
   "primary_domain": "domain_id",
-  "primary_concern": "the presenting concern name from the domain tree that best matches",
+  "primary_concern": "EXACT concern name from the list above — copy it character for character",
   "additional_domains": ["domain_id"],
   "child_age_months": null,
   "intake_fields": {{"frequency": "...", "intensity": "..."}},
@@ -478,6 +479,7 @@ Return this JSON structure:
 }}
 
 IMPORTANT:
+- primary_concern MUST be an exact string from the concerns listed above. Do NOT rephrase or create your own name.
 - If the parent mentions the child's age, convert it to months and set child_age_months (e.g. "5 years" = 60, "3.5 years" = 42, "18 months" = 18). Set null if not mentioned.
 - Only include intake_fields explicitly mentioned by the parent."""
 
@@ -502,6 +504,114 @@ IMPORTANT:
                 "intake_fields": {},
                 "safety_flags": [],
             }
+
+    # ------------------------------------------------------------------
+    # NLG: Generate intake question (age, FICICW)
+    # ------------------------------------------------------------------
+
+    def generate_intake_question(
+        self,
+        field_name: str,
+        concern_name: str,
+        conversation_history: list[dict[str, str]],
+    ) -> str:
+        """Generate a natural intake question for a specific FICICW field."""
+
+        field_prompts = {
+            "child_age": "Ask how old the child is (in years and months).",
+            "frequency": "Ask how often this concern happens (daily, weekly, etc.).",
+            "intensity": "Ask how strong or severe it gets when it does happen.",
+            "current_methods": "Ask what they've already tried to address this (any strategies, therapy, etc.).",
+            "where_happening": "Ask where this mainly happens — at home, school, or both.",
+            "life_impact": "Ask how this is affecting the child's daily life, relationships, or learning.",
+        }
+
+        prompt_instruction = field_prompts.get(field_name, f"Ask about {field_name}.")
+
+        recent_turns = conversation_history[-4:] if len(conversation_history) > 4 else conversation_history
+        conv_context = ""
+        for turn in recent_turns:
+            role = turn.get("role", "")
+            content = turn.get("content", "")
+            if role == "assistant":
+                conv_context += f"You: {content}\n"
+            elif role == "user":
+                conv_context += f"Parent: {content}\n"
+
+        system_prompt = """You are OPenly, a child developmental screening chatbot. You conduct structured intake interviews the way a developmental pediatrician would — professional, efficient, kind but not effusive.
+
+RULES:
+- 1 sentence only. Under 25 words.
+- Ask ONE specific question about the intake dimension.
+- Don't repeat or paraphrase what the parent already said.
+- A brief "Okay" or "Got it" is sufficient acknowledgment.
+- Sound like a real professional, not a therapy chatbot."""
+
+        user_prompt = f"""Concern being discussed: {concern_name}
+
+Recent conversation:
+{conv_context}
+
+Intake question to ask: {prompt_instruction}
+
+Generate a natural, concise question (1 sentence, under 25 words):"""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=60,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            return response.content[0].text.strip()
+        except Exception:
+            # Fallback questions
+            fallbacks = {
+                "child_age": "How old is your child?",
+                "frequency": "How often does this happen?",
+                "intensity": "How intense does it get when it happens?",
+                "current_methods": "Have you tried anything to address this so far?",
+                "where_happening": "Does this mainly happen at home, school, or both?",
+                "life_impact": "How is this affecting their daily routine?",
+            }
+            return fallbacks.get(field_name, f"Can you tell me about the {field_name}?")
+
+    def extract_age_from_response(self, parent_message: str) -> int | None:
+        """Extract child age in months from a parent's response."""
+        system_prompt = """Extract the child's age from the parent's message and convert to months.
+Return ONLY a JSON object, no markdown."""
+
+        user_prompt = f"""Parent says: "{parent_message}"
+
+Return this JSON:
+{{"age_months": <integer or null>}}
+
+Examples:
+- "She is 5 years old" -> {{"age_months": 60}}
+- "He's 3 and a half" -> {{"age_months": 42}}
+- "18 months" -> {{"age_months": 18}}
+- "Almost 2" -> {{"age_months": 22}}
+- No age mentioned -> {{"age_months": null}}"""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=50,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = response.content[0].text.strip()
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\n?", "", cleaned)
+                cleaned = re.sub(r"\n?```$", "", cleaned)
+            data = json.loads(cleaned.strip())
+            age = data.get("age_months")
+            if age is not None:
+                return int(age)
+            return None
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # NLU: Match concern when transitioning to a queued domain
