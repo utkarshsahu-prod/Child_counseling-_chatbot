@@ -327,8 +327,8 @@ class OpenlyGraph:
     _INTAKE_SEQUENCE = [
         "child_age",
         "frequency",
-        "intensity",
         "current_methods",
+        "intensity",
         "where_happening",
         "life_impact",
     ]
